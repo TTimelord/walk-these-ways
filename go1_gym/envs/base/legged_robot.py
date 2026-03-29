@@ -537,7 +537,7 @@ class LeggedRobot(BaseTask):
 
         if len(env_ids_train) > 0:
             ret = func(env_ids_train, self.cfg)
-        if len(env_ids_eval) > 0:
+        if self.eval_cfg is not None and len(env_ids_eval) > 0:
             ret_eval = func(env_ids_eval, self.eval_cfg)
             if ret is not None and ret_eval is not None: ret = torch.cat((ret, ret_eval), axis=-1)
 
