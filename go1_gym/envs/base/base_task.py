@@ -31,9 +31,9 @@ class BaseTask(gym.Env):
         else:
             self.device = 'cpu'
 
-        # graphics device for rendering, -1 for no rendering
+        # Keep a graphics device when headless recording is enabled so camera sensors can be created.
         self.graphics_device_id = self.sim_device_id
-        if self.headless == True:
+        if self.headless == True and not getattr(cfg.env, "record_video", False):
             self.graphics_device_id = -1
 
         self.num_obs = cfg.env.num_observations

@@ -1,11 +1,15 @@
+import argparse
+from datetime import datetime
 import isaacgym
 
 assert isaacgym
 import torch
 import numpy as np
+import imageio.v2 as imageio
 
 import glob
 import pickle as pkl
+from pathlib import Path
 
 from go1_gym.envs.base.legged_robot_config import Cfg
 from go1_gym.envs.go1.reach_avoid_env import ReachAvoidEnv, make_default_scene
@@ -35,6 +39,31 @@ def load_policy(logdir):
 
 def unwrap_base_env(env):
     return env.env if hasattr(env, "env") else env
+
+
+def make_output_dir(output_dir=None):
+    if output_dir is not None:
+        path = Path(output_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = Path(__file__).resolve().parents[1] / "outputs" / "reach_avoid" / timestamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def capture_frame(base_env):
+    frame = np.asarray(base_env.render(mode="rgb_array"), dtype=np.uint8)
+    if frame.ndim == 3 and frame.shape[-1] == 4:
+        frame = frame[..., :3]
+    return frame.copy()
+
+
+def write_video(frames, video_path, fps):
+    if len(frames) == 0:
+        return
+    video_path = Path(video_path)
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(video_path, frames, fps=fps)
 
 
 def load_env(label, headless=False, scene=None):
@@ -69,6 +98,7 @@ def load_env(label, headless=False, scene=None):
 
     Cfg.env.num_recording_envs = 1
     Cfg.env.num_envs = 1
+    Cfg.env.record_video = True
     Cfg.terrain.num_rows = 5
     Cfg.terrain.num_cols = 5
     Cfg.terrain.border_size = 0
@@ -91,11 +121,24 @@ def load_env(label, headless=False, scene=None):
 
 
 def play_go1(headless=True, scene=None, target_velocity=(1.5, 0.0, 0.0), num_eval_steps=250,
-             stop_on_collision=False, stop_on_goal_reached=False):
+             stop_on_collision=False, stop_on_goal_reached=False, output_dir=None,
+             record_video=None, save_plots=None):
     label = "gait-conditioned-agility/pretrain-v0/train"
 
     if scene is None:
         scene = make_default_scene()
+
+    if record_video is None:
+        record_video = headless
+    if save_plots is None:
+        save_plots = headless
+    if output_dir is not None:
+        record_video = True
+        save_plots = True
+
+    artifacts_dir = None
+    if record_video or save_plots:
+        artifacts_dir = make_output_dir(output_dir)
 
     env, policy = load_env(label, headless=headless, scene=scene)
     base_env = unwrap_base_env(env)
@@ -123,6 +166,10 @@ def play_go1(headless=True, scene=None, target_velocity=(1.5, 0.0, 0.0), num_eva
     goal_flags = np.zeros(num_eval_steps, dtype=np.int32)
 
     obs = env.reset()
+
+    frames = []
+    if record_video:
+        frames.append(capture_frame(base_env))
 
     collision_step = None
     collision_name = None
@@ -152,6 +199,8 @@ def play_go1(headless=True, scene=None, target_velocity=(1.5, 0.0, 0.0), num_eva
         base_positions[i] = base_env.root_states[0, 0:3].detach().cpu().numpy()
         base_quat = base_env.root_states[0, 3:7].detach().cpu().numpy()
         base_yaws[i] = quat_xyzw_to_yaw(base_quat)
+        if record_video:
+            frames.append(capture_frame(base_env))
 
         collision_now = bool(scene_info.get("collision", False))
         collision_hit = scene_info.get("collision_name")
@@ -176,7 +225,16 @@ def play_go1(headless=True, scene=None, target_velocity=(1.5, 0.0, 0.0), num_eva
     time = np.linspace(0, actual_steps * base_env.dt, actual_steps, endpoint=False)
     valid = slice(0, actual_steps)
 
+    if record_video and artifacts_dir is not None:
+        fps = max(1, int(round(1.0 / base_env.dt)))
+        video_path = artifacts_dir / "rollout.mp4"
+        write_video(frames[:actual_steps + 1], video_path, fps)
+        print(f"Saved video to {video_path}")
+
     # plot target and measured forward velocity
+    if headless:
+        import matplotlib
+        matplotlib.use("Agg")
     from matplotlib import pyplot as plt
     fig, axs = plt.subplots(5, 1, figsize=(12, 15))
     axs[0].plot(time, measured_x_vels[valid], color='black', linestyle="-", label="Measured")
@@ -217,7 +275,14 @@ def play_go1(headless=True, scene=None, target_velocity=(1.5, 0.0, 0.0), num_eva
     axs[4].legend(loc="upper right")
 
     plt.tight_layout()
-    plt.show()
+    if save_plots and artifacts_dir is not None:
+        plot_path = artifacts_dir / "rollout_metrics.png"
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        print(f"Saved plots to {plot_path}")
+    if headless:
+        plt.close(fig)
+    else:
+        plt.show()
 
     print(f"Collision detected: {collision_step is not None}" +
           (f" at step {collision_step} ({collision_name})" if collision_step is not None else ""))
@@ -235,9 +300,27 @@ def play_go1(headless=True, scene=None, target_velocity=(1.5, 0.0, 0.0), num_eva
         "base_yaws": base_yaws[:actual_steps],
         "measured_x_vels": measured_x_vels[:actual_steps],
         "target_x_vels": target_x_vels[:actual_steps],
+        "artifacts_dir": str(artifacts_dir) if artifacts_dir is not None else None,
     }
 
 
 if __name__ == '__main__':
-    # to see the environment rendering, set headless=False
-    play_go1(headless=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--headless", action="store_true", help="Run without a viewer and save artifacts to disk.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory to save plots and video.")
+    parser.add_argument("--save-video", action="store_true", help="Save rollout video even when not headless.")
+    parser.add_argument("--save-plots", action="store_true", help="Save rollout plots even when not headless.")
+    parser.add_argument("--steps", type=int, default=250, help="Number of rollout steps.")
+    parser.add_argument("--stop-on-collision", action="store_true", help="Stop early when a collision is detected.")
+    parser.add_argument("--stop-on-goal-reached", action="store_true", help="Stop early when the goal is reached.")
+    args = parser.parse_args()
+
+    play_go1(
+        headless=args.headless,
+        num_eval_steps=args.steps,
+        stop_on_collision=args.stop_on_collision,
+        stop_on_goal_reached=args.stop_on_goal_reached,
+        output_dir=args.output_dir,
+        record_video=args.save_video,
+        save_plots=args.save_plots,
+    )
