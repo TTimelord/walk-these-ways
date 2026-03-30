@@ -65,6 +65,10 @@ class ReachAvoidEnv(VelocityTrackingEasyEnv):
         self.auto_reset = bool(auto_reset)
         self.scene_objects = None
         self.scene_status = {}
+        self.scene_collision_buf = None
+        self.scene_goal_buf = None
+        self.scene_collision_names = []
+        self.scene_goal_names = []
         self.scene_asset_cache = {}
 
         super().__init__(
@@ -251,6 +255,10 @@ class ReachAvoidEnv(VelocityTrackingEasyEnv):
             "obstacles": [[] for _ in range(self.num_envs)],
             "goals": [[] for _ in range(self.num_envs)],
         }
+        self.robot_actor_indices = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
+        self.robot_body_indices = torch.zeros(
+            self.num_envs, self.num_bodies, dtype=torch.long, device=self.device, requires_grad=False
+        )
 
         for i in range(self.num_envs):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
@@ -286,6 +294,14 @@ class ReachAvoidEnv(VelocityTrackingEasyEnv):
             body_props = self._process_rigid_body_props(body_props, i)
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
 
+            self.envs.append(env_handle)
+            self.actor_handles.append(actor_handle)
+            self.robot_actor_indices[i] = self.gym.get_actor_index(env_handle, actor_handle, gymapi.DOMAIN_SIM)
+            for body_idx, body_name in enumerate(body_names):
+                self.robot_body_indices[i, body_idx] = self.gym.find_actor_rigid_body_index(
+                    env_handle, actor_handle, body_name, gymapi.DOMAIN_SIM
+                )
+
             for obstacle in self.scene_cfg.get("obstacles", []):
                 obstacle_asset = self._load_scene_asset(
                     "cylinder",
@@ -302,9 +318,6 @@ class ReachAvoidEnv(VelocityTrackingEasyEnv):
                     visual_only=True,
                 )
                 self._spawn_scene_actor(env_handle, i, goal_asset, goal, "goal")
-
-            self.envs.append(env_handle)
-            self.actor_handles.append(actor_handle)
 
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(feet_names)):
@@ -349,6 +362,10 @@ class ReachAvoidEnv(VelocityTrackingEasyEnv):
                     gymapi.Vec3(1.5, 1, 3.0),
                     gymapi.Vec3(0, 0, 0),
                 )
+        self.scene_collision_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.scene_goal_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.scene_collision_names = [None for _ in range(self.num_envs)]
+        self.scene_goal_names = [None for _ in range(self.num_envs)]
         self.video_writer = None
         self.video_frames = []
         self.video_frames_eval = []
@@ -395,12 +412,39 @@ class ReachAvoidEnv(VelocityTrackingEasyEnv):
             "goal_name": goal_name,
         }
 
+    def _update_scene_status(self):
+        collision = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        collision_names = [None for _ in range(self.num_envs)]
+        goal_names = [None for _ in range(self.num_envs)]
+
+        for env_id in range(self.num_envs):
+            collision[env_id], collision_names[env_id] = self.check_collision(env_id=env_id)
+            goal_reached[env_id], goal_names[env_id] = self.check_goal_reached(env_id=env_id)
+
+        self.scene_collision_buf = collision
+        self.scene_goal_buf = goal_reached
+        self.scene_collision_names = collision_names
+        self.scene_goal_names = goal_names
+        self.scene_status = {
+            "collision": collision,
+            "collision_name": collision_names,
+            "goal_reached": goal_reached,
+            "goal_name": goal_names,
+        }
+        return self.scene_status
+
     def check_termination(self):
         """Task-specific termination: timeout, collision, or goal reached."""
+        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.,
+                                   dim=1)
         self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length
-        self.reset_buf = self.time_out_buf.clone()
-        if self.scene_status.get("collision", False) or self.scene_status.get("goal_reached", False):
-            self.reset_buf |= torch.ones_like(self.reset_buf, dtype=torch.bool)
+        self.reset_buf |= self.time_out_buf
+        if self.cfg.rewards.use_terminal_body_height:
+            self.body_height_buf = torch.mean(self.base_pos[:, 2].unsqueeze(1) - self.measured_heights, dim=1) \
+                                   < self.cfg.rewards.terminal_body_height
+            self.reset_buf = torch.logical_or(self.body_height_buf, self.reset_buf)
+        self.reset_buf |= self.scene_collision_buf | self.scene_goal_buf
 
     def post_physics_step(self):
         self.gym.refresh_actor_root_state_tensor(self.sim)
@@ -410,22 +454,15 @@ class ReachAvoidEnv(VelocityTrackingEasyEnv):
             self.gym.step_graphics(self.sim)
             self.gym.render_all_camera_sensors(self.sim)
 
+        self._refresh_robot_state_views()
+
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
-        self.base_pos[:] = self.root_states[:self.num_envs, 0:3]
-        self.base_quat[:] = self.root_states[:self.num_envs, 3:7]
-        self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:self.num_envs, 7:10])
-        self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:self.num_envs, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
-        self.foot_velocities = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13
-                                                          )[:, self.feet_indices, 7:10]
-        self.foot_positions = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices,
-                              0:3]
-
         self._post_physics_step_callback()
-        self.scene_status = self.get_scene_status(env_id=0)
+        self._update_scene_status()
         self.extras["scene"] = self.scene_status
 
         self.check_termination()
